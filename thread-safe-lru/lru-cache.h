@@ -49,6 +49,10 @@ struct ListNode {
     }
 
     static ListNode<TKey>* const OutOfListMarker;
+
+    void destroy() {
+      Rai::Delete(this);
+    }
 };
 
 /**
@@ -193,8 +197,6 @@ ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::NullValue = TValue
 template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
 TValue ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 get(const TKey& key) {
-  //we need this lock to make sure that the looked up element is not freed before being dereferenced
-  turf::LockGuard<turf::Mutex> delete_lock(m_insertMutex[THashMap::KeyTraits::hash(key) % NUM_INSERT_MUTEX]);
   auto res = m_map.get(key);
   if (res == nullptr) {
     return NullValue;
@@ -213,11 +215,7 @@ get(const TKey& key) {
       delink(node);
       pushFront(node);
     }
-    //We need the delete_lock until here, as it's possible that a concurrent evict() deallocates the node
-    delete_lock.unlock();
     lock.unlock();
-  } else {
-    delete_lock.unlock();
   }
   return resValue;
 }
@@ -234,10 +232,7 @@ insert(const TKey& key, const TValue& value, size_t value_size) {
   if (oldValue) {
     oldNode = oldValue->m_listNode;
     m_size.fetch_sub(oldValue->m_value->length());
-    //This thread is the only one that has the oldValue, so it's safe to get the lock here
-    turf::LockGuard<turf::Mutex> delete_lock(m_insertMutex[THashMap::KeyTraits::hash(key) % NUM_INSERT_MUTEX]);
     junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, oldValue);
-    delete_lock.unlock();
   }
 
   m_size.fetch_add(value_size);
@@ -248,7 +243,7 @@ insert(const TKey& key, const TValue& value, size_t value_size) {
     delink(oldNode);
     lock.unlock();
 
-    Rai::Delete(oldNode);
+    junction::DefaultQSBR.enqueue(&ListNode<TKey>::destroy, oldNode);
     return false;
   } else {
     lock.unlock();
@@ -267,7 +262,7 @@ clear() {
     if(node_in_map) {
       junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, node_in_map);
     }
-    Rai::Delete(node);
+    junction::DefaultQSBR.enqueue(&ListNode<TKey>::destroy, node);
     node = next;
   }
   m_head.m_next = &m_tail;
@@ -315,11 +310,8 @@ evict() {
 
   size_t res_size = deleted_Res->m_value->length();
 
-  turf::LockGuard<turf::Mutex> delete_lock(m_insertMutex[THashMap::KeyTraits::hash(moribund->m_key) % NUM_INSERT_MUTEX]);
   junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, deleted_Res);
-  delete_lock.unlock();
-
-  Rai::Delete(moribund);
+  junction::DefaultQSBR.enqueue(&ListNode<TKey>::destroy, moribund);
   return res_size;
 }
 
