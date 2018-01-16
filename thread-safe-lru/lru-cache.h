@@ -169,7 +169,7 @@ ThreadSafeLRUCache()
 
 template <class TKey, class TValue, class THashMap>
 const TValue
-ThreadSafeLRUCache<TKey, TValue, THashMap>::NullValue = TValue(THashMap::ValueTraits::NullValue);
+ThreadSafeLRUCache<TKey, TValue, THashMap>::NullValue = TValue(/*THashMap::ValueTraits::NullValue*/);
 
 template <class TKey, class TValue, class THashMap>
 TValue ThreadSafeLRUCache<TKey, TValue, THashMap>::
