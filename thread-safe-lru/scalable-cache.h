@@ -18,7 +18,6 @@
 #define incl_tstarling_SCALABLE_CACHE_H
 
 #include "thread-safe-lru/lru-cache.h"
-#include "thread-safe-lru/string-key.h"
 #include <limits>
 #include <memory>
 
@@ -37,10 +36,9 @@ namespace tstarling {
  * a key with a memoized hash function. ThreadSafeStringKey is provided for
  * this purpose.
  */
-template <class TKey, class TValue, class THash = tbb::tbb_hash_compare<TKey>>
+template <class TKey, class TValue, class THashMapMap=junction::ConcurrentMap_Grampa<TKey, std::shared_ptr<HashMapValue<TKey, TValue> >* > >
 struct ThreadSafeScalableCache {
-  using Shard = ThreadSafeLRUCache<TKey, TValue, THash>;
-  typedef typename Shard::ConstAccessor ConstAccessor;
+  using Shard = ThreadSafeLRUCache<TKey, TValue, THashMapMap>;
 
   /**
    * Constructor
@@ -49,7 +47,7 @@ struct ThreadSafeScalableCache {
    *     "hardware concurrency" will be used (typically the logical processor
    *     count).
    */
-  explicit ThreadSafeScalableCache(size_t maxSize, size_t numShards = 0);
+  explicit ThreadSafeScalableCache(size_t numShards = 0);
 
   ThreadSafeScalableCache(const ThreadSafeScalableCache&) = delete;
   ThreadSafeScalableCache& operator=(const ThreadSafeScalableCache&) = delete;
@@ -60,7 +58,7 @@ struct ThreadSafeScalableCache {
    * otherwise. Updates the eviction list, making the element the
    * most-recently used.
    */
-  bool find(ConstAccessor& ac, const TKey& key);
+  TValue get(TKey key);
 
   /**
    * Insert a value into the container. Both the key and value will be copied.
@@ -73,6 +71,7 @@ struct ThreadSafeScalableCache {
    */
   bool insert(const TKey& key, const TValue& value);
 
+private:
   /**
    * Clear the container. NOT THREAD SAFE -- do not use while other threads
    * are accessing the container.
@@ -80,28 +79,9 @@ struct ThreadSafeScalableCache {
   void clear();
 
   /**
-   * Get a snapshot of the keys in the container by copying them into the
-   * supplied vector. This will block inserts and prevent LRU updates while it
-   * completes. The keys will be inserted in a random order.
-   */
-  void snapshotKeys(std::vector<TKey>& keys);
-
-  /**
-   * Get the approximate size of the container. May be slightly too low when
-   * insertion is in progress.
-   */
-  size_t size() const;
-
-private:
-  /**
    * Get the child container for a given key
    */
   Shard& getShard(const TKey& key);
-
-  /**
-   * The maximum number of elements in the container.
-   */
-  size_t m_maxSize;
 
   /**
    * The child containers
@@ -111,77 +91,47 @@ private:
   std::vector<ShardPtr> m_shards;
 };
 
-/**
- * A specialisation of ThreadSafeScalableCache providing a cache with efficient
- * string keys.
- */
-template <class TValue>
-using ThreadSafeStringCache = ThreadSafeScalableCache<
-    ThreadSafeStringKey, TValue, ThreadSafeStringKey::HashCompare>;
-
-template <class TKey, class TValue, class THash>
-ThreadSafeScalableCache<TKey, TValue, THash>::
-ThreadSafeScalableCache(size_t maxSize, size_t numShards)
-  : m_maxSize(maxSize), m_numShards(numShards)
+template <class TKey, class TValue, class THashMap>
+ThreadSafeScalableCache<TKey, TValue, THashMap>::
+ThreadSafeScalableCache(size_t numShards)
+  : m_numShards(numShards)
 {
   if (m_numShards == 0) {
     m_numShards = std::thread::hardware_concurrency();
   }
   for (size_t i = 0; i < m_numShards; i++) {
-    size_t s = maxSize / m_numShards;
-    if (i == 0) {
-      s += maxSize % m_numShards;
-    }
-    m_shards.emplace_back(std::make_shared<Shard>(s));
+    m_shards.emplace_back(std::make_shared<Shard>());
   }
 }
 
-template <class TKey, class TValue, class THash>
-typename ThreadSafeScalableCache<TKey, TValue, THash>::Shard&
-ThreadSafeScalableCache<TKey, TValue, THash>::
+template <class TKey, class TValue, class THashMap>
+typename ThreadSafeScalableCache<TKey, TValue, THashMap>::Shard&
+ThreadSafeScalableCache<TKey, TValue, THashMap>::
 getShard(const TKey& key) {
-  THash hashObj;
+  typename THashMap::KeyTraits hashObj;
   constexpr int shift = std::numeric_limits<size_t>::digits - 16;
   size_t h = (hashObj.hash(key) >> shift) % m_numShards;
   return *m_shards.at(h);
 }
 
-template <class TKey, class TValue, class THash>
-bool ThreadSafeScalableCache<TKey, TValue, THash>::
-find(ConstAccessor& ac, const TKey& key) {
-  return getShard(key).find(ac, key);
+template <class TKey, class TValue, class THashMap>
+TValue ThreadSafeScalableCache<TKey, TValue, THashMap>::
+get(TKey key) {
+  return getShard(key).get(key);
 }
 
-template <class TKey, class TValue, class THash>
-bool ThreadSafeScalableCache<TKey, TValue, THash>::
+template <class TKey, class TValue, class THashMap>
+bool ThreadSafeScalableCache<TKey, TValue, THashMap>::
 insert(const TKey& key, const TValue& value) {
   return getShard(key).insert(key, value);
 }
 
-template <class TKey, class TValue, class THash>
-void ThreadSafeScalableCache<TKey, TValue, THash>::
+template <class TKey, class TValue, class THashMap>
+void ThreadSafeScalableCache<TKey, TValue, THashMap>::
 clear() {
   for (size_t i = 0; i < m_numShards; i++) {
     m_shards[i]->clear();
   }
-}
-
-template <class TKey, class TValue, class THash>
-void ThreadSafeScalableCache<TKey, TValue, THash>::
-snapshotKeys(std::vector<TKey>& keys) {
-  for (size_t i = 0; i < m_numShards; i++) {
-    m_shards[i]->snapshotKeys(keys);
-  }
-}
-
-template <class TKey, class TValue, class THash>
-size_t ThreadSafeScalableCache<TKey, TValue, THash>::
-size() const {
-  size_t size;
-  for (size_t i = 0; i < m_numShards; i++) {
-    size += m_shards[i]->size();
-  }
-  return size;
 }
 
 } // namespace tstarling
