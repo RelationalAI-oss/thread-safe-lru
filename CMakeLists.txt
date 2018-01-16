@@ -16,6 +16,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(benchmark ${Boost_LIBRARIES})
     include_directories(${Boost_INCLUDE_DIRS})
     
-    include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
     set(CMAKE_CXX_FLAGS "-std=c++11 -O3")
 endif()
+
+file(GLOB LRUCache_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/thread-safe-lru/*.h")
+file(GLOB LRUCache_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+file(GLOB LRUCache_SRC ${LRUCache_HEADERS} ${LRUCache_SOURCES})
+
+add_library(thread-safe-lru ${LRUCache_SRC})
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
