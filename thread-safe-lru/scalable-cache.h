@@ -39,7 +39,7 @@ namespace tstarling {
  * a key with a memoized hash function. ThreadSafeStringKey is provided for
  * this purpose.
  */
-template <class TKey, class TValue, class THashMapMap=junction::ConcurrentMap_Grampa<TKey, std::shared_ptr<HashMapValue<TKey, TValue> >* > >
+template <class TKey, class TValue, class THashMapMap=junction::ConcurrentMap_Grampa<TKey, HashMapValue<TKey, TValue>*> >
 struct ThreadSafeScalableCache {
   using Shard = ThreadSafeLRUCache<TKey, TValue, THashMapMap>;
 

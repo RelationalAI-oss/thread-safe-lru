@@ -67,27 +67,20 @@ struct HashMapValue {
 
     TValue m_value;
     ListNode<TKey>* m_listNode;
+
+    void destroy() {
+      Rai::Delete(this);
+    }
 };
 
 /**
  * ThreadSafeLRUCache is a thread-safe LRU hashtable.
  */
-template <class TKey, class TValue, class THashMap=junction::ConcurrentMap_Grampa<TKey, std::shared_ptr<HashMapValue<TKey, TValue> >* >, int NUM_INSERT_MUTEX = 256 >
+template <class TKey, class TValue, class THashMap=junction::ConcurrentMap_Grampa<TKey, HashMapValue<TKey, TValue>*>, int NUM_INSERT_MUTEX = 256 >
 class ThreadSafeLRUCache {
 
   typedef THashMap HashMap;
   static const TValue NullValue;
-
-  struct ValueContainer {
-      std::shared_ptr<HashMapValue<TKey, TValue> >* v;
-
-      ValueContainer(std::shared_ptr<HashMapValue<TKey, TValue> >* value) : v(value) {}
-
-      void destroy() {
-          Rai::Delete(v);
-          delete this;
-      }
-  };
 public:
 
   /**
@@ -200,17 +193,19 @@ ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::NullValue = TValue
 template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
 TValue ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 get(const TKey& key) {
-  auto res_ptr = m_map.get(key);
-  if (res_ptr == nullptr) {
+  //we need this lock to make sure that the looked up element is not freed before being dereferenced
+  turf::LockGuard<turf::Mutex> delete_lock(m_insertMutex[THashMap::KeyTraits::hash(key) % NUM_INSERT_MUTEX]);
+  auto res = m_map.get(key);
+  if (res == nullptr) {
     return NullValue;
   }
-
-  auto res = *res_ptr;
+  auto resListNode = res->m_listNode;
+  auto resValue = res->m_value;
 
   // Acquire the lock, but don't block if it is already held
   std::unique_lock<ListMutex> lock(m_listMutex, std::try_to_lock);
   if (lock) {
-    ListNode<TKey>* node = res->m_listNode;
+    ListNode<TKey>* node = resListNode;
     // The list node may be out of the list if it is in the process of being
     // inserted or evicted. Doing this check allows us to lock the list for
     // shorter periods of time.
@@ -218,37 +213,47 @@ get(const TKey& key) {
       delink(node);
       pushFront(node);
     }
+    //We need the delete_lock until here, as it's possible that a concurrent evict() deallocates the node
+    delete_lock.unlock();
     lock.unlock();
+  } else {
+    delete_lock.unlock();
   }
-  return res->m_value;
+  return resValue;
 }
 
 template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
 bool ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 insert(const TKey& key, const TValue& value, size_t value_size) {
-  ListNode<TKey>* node = nullptr;
-
   // Insert into the CHM
-  typename THashMap::Mutator mutator = m_map.insertOrFind(key);
-  auto current_val = mutator.getValue();
-  if (!current_val) {
-    node = Rai::New<ListNode<TKey> >("new_Node", key);
-    auto ptr = Rai::MakeShared<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
-    auto current_val = Rai::New<std::shared_ptr<HashMapValue<TKey, TValue> > >("new_HashMapValue", ptr);
+  ListNode<TKey>* node = Rai::New<ListNode<TKey> >("new_Node", key);
+  auto newValue = Rai::New<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
 
-    auto oldValue = mutator.exchangeValue(current_val);
-    if (oldValue)
-      junction::DefaultQSBR.enqueue(&ValueContainer::destroy, new ValueContainer(oldValue));
-  } else {
-    return false;
+  auto oldValue = m_map.exchange(key, newValue);
+  ListNode<TKey>* oldNode = nullptr;
+  if (oldValue) {
+    oldNode = oldValue->m_listNode;
+    m_size.fetch_sub(oldValue->m_value->length());
+    //This thread is the only one that has the oldValue, so it's safe to get the lock here
+    turf::LockGuard<turf::Mutex> delete_lock(m_insertMutex[THashMap::KeyTraits::hash(key) % NUM_INSERT_MUTEX]);
+    junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, oldValue);
+    delete_lock.unlock();
   }
 
   m_size.fetch_add(value_size);
 
   std::unique_lock<ListMutex> lock(m_listMutex);
   pushFront(node);
-  lock.unlock();
-  return true;
+  if(oldNode != nullptr) {
+    delink(oldNode);
+    lock.unlock();
+
+    Rai::Delete(oldNode);
+    return false;
+  } else {
+    lock.unlock();
+    return true;
+  }
 }
 
 template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
@@ -258,9 +263,9 @@ clear() {
   ListNode<TKey>* next;
   while (node != &m_tail) {
     next = node->m_next;
-    auto node_in_map = m_map.get(node->m_key);
+    auto node_in_map = m_map.erase(node->m_key);
     if(node_in_map) {
-      junction::DefaultQSBR.enqueue(&ValueContainer::destroy, new ValueContainer(node_in_map));
+      junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, node_in_map);
     }
     Rai::Delete(node);
     node = next;
@@ -302,16 +307,17 @@ evict() {
   delink(moribund);
   lock.unlock();
 
-  auto res = m_map.find(moribund->m_key);
-  auto deleted_Res = res.eraseValue();
+  auto deleted_Res = m_map.erase(moribund->m_key);
   if (deleted_Res == nullptr) {
     // Presumably unreachable
     return 0;
   }
 
-  size_t res_size = (*deleted_Res)->m_value->length();
+  size_t res_size = deleted_Res->m_value->length();
 
-  junction::DefaultQSBR.enqueue(&ValueContainer::destroy, new ValueContainer(deleted_Res));
+  turf::LockGuard<turf::Mutex> delete_lock(m_insertMutex[THashMap::KeyTraits::hash(moribund->m_key) % NUM_INSERT_MUTEX]);
+  junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, deleted_Res);
+  delete_lock.unlock();
 
   Rai::Delete(moribund);
   return res_size;
