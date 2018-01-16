@@ -108,7 +108,15 @@ public:
    * will not be updated, and false will be returned. Otherwise, true will be
    * returned.
    */
-  bool insert(const TKey& key, const TValue& value);
+  bool insert(const TKey& key, const TValue& value, size_t value_size = 1);
+
+  /**
+   * Get the approximate size of the container. May be slightly too low when
+   * insertion is in progress.
+   */
+  size_t size() const {
+    return m_size.load();
+  }
 
 private:
 
@@ -138,6 +146,13 @@ private:
    */
   void evict();
 
+  /**
+   * This atomic variable is used to signal to all threads whether or not
+   * eviction should be done on insert. It is approximately equal to the
+   * number of elements in the container.
+   */
+  std::atomic<size_t> m_size;
+
   /** 
    * The underlying hash map.
    */
@@ -160,7 +175,7 @@ ListNode<TKey>::OutOfListMarker = (ListNode<TKey>*)-1;
 
 template <class TKey, class TValue, class THashMap>
 ThreadSafeLRUCache<TKey, TValue, THashMap>::
-ThreadSafeLRUCache()
+ThreadSafeLRUCache() : m_size(0)
 {
   m_head.m_prev = nullptr;
   m_head.m_next = &m_tail;
@@ -197,7 +212,7 @@ get(TKey key) {
 
 template <class TKey, class TValue, class THashMap>
 bool ThreadSafeLRUCache<TKey, TValue, THashMap>::
-insert(const TKey& key, const TValue& value) {
+insert(const TKey& key, const TValue& value, size_t value_size) {
   // Insert into the CHM
   ListNode<TKey>* node = Rai::New<ListNode<TKey> >("new_Node", key);
   auto ptr = Rai::MakeShared<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
@@ -205,6 +220,8 @@ insert(const TKey& key, const TValue& value) {
     Rai::Delete(node);
     return false;
   }
+
+  m_size.fetch_add(value_size);
 
   std::unique_lock<ListMutex> lock(m_listMutex);
   pushFront(node);
@@ -235,6 +252,7 @@ clear() {
   }
   m_head.m_next = &m_tail;
   m_tail.m_prev = &m_head;
+  m_size = 0;
 }
 
 template <class TKey, class TValue, class THashMap>

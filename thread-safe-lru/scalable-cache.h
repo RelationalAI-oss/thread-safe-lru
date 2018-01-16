@@ -69,7 +69,13 @@ struct ThreadSafeScalableCache {
    * will not be updated, and false will be returned. Otherwise, true will be
    * returned.
    */
-  bool insert(const TKey& key, const TValue& value);
+  bool insert(const TKey& key, const TValue& value, size_t value_size = 1);
+
+  /**
+   * Get the approximate size of the container. May be slightly too low when
+   * insertion is in progress.
+   */
+  size_t size() const;
 
 private:
   /**
@@ -122,8 +128,8 @@ get(TKey key) {
 
 template <class TKey, class TValue, class THashMap>
 bool ThreadSafeScalableCache<TKey, TValue, THashMap>::
-insert(const TKey& key, const TValue& value) {
-  return getShard(key).insert(key, value);
+insert(const TKey& key, const TValue& value, size_t value_size) {
+  return getShard(key).insert(key, value, value_size);
 }
 
 template <class TKey, class TValue, class THashMap>
@@ -132,6 +138,16 @@ clear() {
   for (size_t i = 0; i < m_numShards; i++) {
     m_shards[i]->clear();
   }
+}
+
+template <class TKey, class TValue, class THash>
+size_t ThreadSafeScalableCache<TKey, TValue, THash>::
+size() const {
+  size_t size;
+  for (size_t i = 0; i < m_numShards; i++) {
+    size += m_shards[i]->size();
+  }
+  return size;
 }
 
 } // namespace tstarling
