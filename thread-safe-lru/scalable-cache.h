@@ -18,8 +18,11 @@
 #define incl_tstarling_SCALABLE_CACHE_H
 
 #include "thread-safe-lru/lru-cache.h"
+#include <thread>
+#include <chrono>
 #include <limits>
 #include <memory>
+#include <queue>
 
 namespace tstarling {
 
@@ -47,10 +50,17 @@ struct ThreadSafeScalableCache {
    *     "hardware concurrency" will be used (typically the logical processor
    *     count).
    */
-  explicit ThreadSafeScalableCache(size_t numShards = 0);
+  explicit ThreadSafeScalableCache(size_t maxSize, size_t gcIntervalMS = 100, size_t numShards = 0);
 
   ThreadSafeScalableCache(const ThreadSafeScalableCache&) = delete;
   ThreadSafeScalableCache& operator=(const ThreadSafeScalableCache&) = delete;
+
+  ~ThreadSafeScalableCache() {
+    m_isTerminated = true;
+    m_gcThread.join();
+    DefaultQSBR.destroyContext(m_qsbrContext);
+    clear();
+  }
 
   /**
    * Find a value by key, and return it by filling the ConstAccessor, which
@@ -58,7 +68,7 @@ struct ThreadSafeScalableCache {
    * otherwise. Updates the eviction list, making the element the
    * most-recently used.
    */
-  TValue get(TKey key);
+  TValue get(const TKey& key);
 
   /**
    * Insert a value into the container. Both the key and value will be copied.
@@ -85,9 +95,19 @@ private:
   void clear();
 
   /**
+   * Collects the garbage.
+   */
+  void gc();
+
+  /**
    * Get the child container for a given key
    */
   Shard& getShard(const TKey& key);
+
+  /**
+   * The maximum size of elements in the container.
+   */
+  size_t m_maxSize;
 
   /**
    * The child containers
@@ -95,19 +115,70 @@ private:
   size_t m_numShards;
   typedef std::shared_ptr<Shard> ShardPtr;
   std::vector<ShardPtr> m_shards;
+
+  /*
+   * Garbage collector thread
+   */
+  std::thread m_gcThread;
+
+  /*
+   * Is the collection being destructed?
+   */
+  std::atomic<bool> m_isTerminated;
+
+  std::chrono::milliseconds m_gcIntervalMS;
+
+  junction::QSBR::Context m_qsbrContext;
+};
+
+template <class TKey, class TValue, class THashMap>
+void ThreadSafeScalableCache<TKey, TValue, THashMap>::
+gc() {
+  while(!m_isTerminated) {
+    size_t size = 0;
+    for (size_t i = 0; i < m_numShards; i++) {
+      size += m_shards[i]->size();
+    }
+
+    if(size >= m_maxSize) {
+      auto cmp = [](ShardPtr left, ShardPtr right) { return left->size() < right->size();};
+      std::priority_queue<ShardPtr, std::vector<ShardPtr>, decltype(cmp)> q(cmp);
+      for (size_t i = 0; i < m_numShards; i++) {
+        q.push(m_shards[i]);
+      }
+
+      while(size >= m_maxSize && !q.empty()) {
+        auto shard = q.top();
+        q.pop();
+        size_t deleted_size = shard->evict();
+        if(deleted_size != 0) {
+          q.push(shard);
+        }
+
+        size -= deleted_size;
+      }
+    }
+
+    junction::DefaultQSBR.update(m_qsbrContext);
+    std::this_thread::sleep_for(m_gcIntervalMS);
+  }
 };
 
 template <class TKey, class TValue, class THashMap>
 ThreadSafeScalableCache<TKey, TValue, THashMap>::
-ThreadSafeScalableCache(size_t numShards)
-  : m_numShards(numShards)
+ThreadSafeScalableCache(size_t maxSize, size_t gcIntervalMS, size_t numShards)
+  : m_maxSize(maxSize), m_numShards(numShards), m_isTerminated(false), m_gcIntervalMS(gcIntervalMS)
 {
   if (m_numShards == 0) {
-    m_numShards = std::thread::hardware_concurrency();
+    m_numShards = std::thread::hardware_concurrency() * 4;
   }
   for (size_t i = 0; i < m_numShards; i++) {
-    m_shards.emplace_back(std::make_shared<Shard>());
+    m_shards.emplace_back(Rai::MakeShared<Shard>("new_Shard_in_ThreadSafeScalableCache"));
   }
+
+  m_qsbrContext = DefaultQSBR.createContext();
+
+  m_gcThread = std::thread(&ThreadSafeScalableCache<TKey, TValue, THashMap>::gc, this);
 }
 
 template <class TKey, class TValue, class THashMap>
@@ -122,7 +193,7 @@ getShard(const TKey& key) {
 
 template <class TKey, class TValue, class THashMap>
 TValue ThreadSafeScalableCache<TKey, TValue, THashMap>::
-get(TKey key) {
+get(const TKey& key) {
   return getShard(key).get(key);
 }
 
@@ -143,7 +214,7 @@ clear() {
 template <class TKey, class TValue, class THash>
 size_t ThreadSafeScalableCache<TKey, TValue, THash>::
 size() const {
-  size_t size;
+  size_t size = 0;
   for (size_t i = 0; i < m_numShards; i++) {
     size += m_shards[i]->size();
   }

@@ -72,11 +72,22 @@ struct HashMapValue {
 /**
  * ThreadSafeLRUCache is a thread-safe LRU hashtable.
  */
-template <class TKey, class TValue, class THashMap=junction::ConcurrentMap_Grampa<TKey, std::shared_ptr<HashMapValue<TKey, TValue> >* > >
+template <class TKey, class TValue, class THashMap=junction::ConcurrentMap_Grampa<TKey, std::shared_ptr<HashMapValue<TKey, TValue> >* >, int NUM_INSERT_MUTEX = 256 >
 class ThreadSafeLRUCache {
 
   typedef THashMap HashMap;
   static const TValue NullValue;
+
+  struct ValueContainer {
+      std::shared_ptr<HashMapValue<TKey, TValue> >* v;
+
+      ValueContainer(std::shared_ptr<HashMapValue<TKey, TValue> >* value) : v(value) {}
+
+      void destroy() {
+          Rai::Delete(v);
+          delete this;
+      }
+  };
 public:
 
   /**
@@ -97,7 +108,7 @@ public:
    * otherwise. Updates the eviction list, making the element the
    * most-recently used.
    */
-  TValue get(TKey key);
+  TValue get(const TKey& key);
 
   /**
    * Insert a value into the container. Both the key and value will be copied.
@@ -118,7 +129,11 @@ public:
     return m_size.load();
   }
 
-private:
+  /**
+   * Evict the least-recently used item from the container. This function does
+   * its own locking.
+   */
+  size_t evict();
 
   /**
    * Clear the container. NOT THREAD SAFE -- do not use while other threads
@@ -126,7 +141,7 @@ private:
    */
   void clear();
 
-  void clear_map();
+private:
 
   /**
    * Unlink a node from the list. The caller must lock the list mutex while
@@ -139,12 +154,6 @@ private:
    * must lock the list mutex while this is called.
    */
   void pushFront(ListNode<TKey>* node);
-
-  /**
-   * Evict the least-recently used item from the container. This function does
-   * its own locking.
-   */
-  void evict();
 
   /**
    * This atomic variable is used to signal to all threads whether or not
@@ -167,14 +176,16 @@ private:
   ListNode<TKey> m_tail;
   typedef std::mutex ListMutex;
   ListMutex m_listMutex;
+  typedef turf::Mutex InsertMutex;
+  InsertMutex m_insertMutex[NUM_INSERT_MUTEX];
 };
 
 template <class TKey>
 ListNode<TKey>* const
 ListNode<TKey>::OutOfListMarker = (ListNode<TKey>*)-1;
 
-template <class TKey, class TValue, class THashMap>
-ThreadSafeLRUCache<TKey, TValue, THashMap>::
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
+ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 ThreadSafeLRUCache() : m_size(0)
 {
   m_head.m_prev = nullptr;
@@ -182,22 +193,24 @@ ThreadSafeLRUCache() : m_size(0)
   m_tail.m_prev = &m_head;
 }
 
-template <class TKey, class TValue, class THashMap>
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
 const TValue
-ThreadSafeLRUCache<TKey, TValue, THashMap>::NullValue = TValue(/*THashMap::ValueTraits::NullValue*/);
+ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::NullValue = TValue(/*THashMap::ValueTraits::NullValue*/);
 
-template <class TKey, class TValue, class THashMap>
-TValue ThreadSafeLRUCache<TKey, TValue, THashMap>::
-get(TKey key) {
-  auto res = m_map.get(key);
-  if (res == nullptr) {
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
+TValue ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
+get(const TKey& key) {
+  auto res_ptr = m_map.get(key);
+  if (res_ptr == nullptr) {
     return NullValue;
   }
+
+  auto res = *res_ptr;
 
   // Acquire the lock, but don't block if it is already held
   std::unique_lock<ListMutex> lock(m_listMutex, std::try_to_lock);
   if (lock) {
-    ListNode<TKey>* node = (*res)->m_listNode;
+    ListNode<TKey>* node = res->m_listNode;
     // The list node may be out of the list if it is in the process of being
     // inserted or evicted. Doing this check allows us to lock the list for
     // shorter periods of time.
@@ -207,17 +220,26 @@ get(TKey key) {
     }
     lock.unlock();
   }
-  return (*res)->m_value;
+  return res->m_value;
 }
 
-template <class TKey, class TValue, class THashMap>
-bool ThreadSafeLRUCache<TKey, TValue, THashMap>::
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
+bool ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 insert(const TKey& key, const TValue& value, size_t value_size) {
+  ListNode<TKey>* node = nullptr;
+
   // Insert into the CHM
-  ListNode<TKey>* node = Rai::New<ListNode<TKey> >("new_Node", key);
-  auto ptr = Rai::MakeShared<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
-  if (m_map.assign(key, Rai::New<std::shared_ptr<HashMapValue<TKey, TValue> > >("new_HashMapValue", ptr))) {
-    Rai::Delete(node);
+  typename THashMap::Mutator mutator = m_map.insertOrFind(key);
+  auto current_val = mutator.getValue();
+  if (!current_val) {
+    node = Rai::New<ListNode<TKey> >("new_Node", key);
+    auto ptr = Rai::MakeShared<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
+    auto current_val = Rai::New<std::shared_ptr<HashMapValue<TKey, TValue> > >("new_HashMapValue", ptr);
+
+    auto oldValue = mutator.exchangeValue(current_val);
+    if (oldValue)
+      junction::DefaultQSBR.enqueue(&ValueContainer::destroy, new ValueContainer(oldValue));
+  } else {
     return false;
   }
 
@@ -229,24 +251,17 @@ insert(const TKey& key, const TValue& value, size_t value_size) {
   return true;
 }
 
-template <class TKey, class TValue, class THashMap>
-void ThreadSafeLRUCache<TKey, TValue, THashMap>::
-clear_map() {
-  typename THashMap::Iterator iter(m_map);
-  while(iter.isValid()) {
-    Rai::Delete(iter.getValue());
-    iter.next();
-  }
-}
-
-template <class TKey, class TValue, class THashMap>
-void ThreadSafeLRUCache<TKey, TValue, THashMap>::
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
+void ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 clear() {
-  clear_map();
   ListNode<TKey>* node = m_head.m_next;
   ListNode<TKey>* next;
   while (node != &m_tail) {
     next = node->m_next;
+    auto node_in_map = m_map.get(node->m_key);
+    if(node_in_map) {
+      junction::DefaultQSBR.enqueue(&ValueContainer::destroy, new ValueContainer(node_in_map));
+    }
     Rai::Delete(node);
     node = next;
   }
@@ -255,8 +270,8 @@ clear() {
   m_size = 0;
 }
 
-template <class TKey, class TValue, class THashMap>
-inline void ThreadSafeLRUCache<TKey, TValue, THashMap>::
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
+inline void ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 delink(ListNode<TKey>* node) {
   ListNode<TKey>* prev = node->m_prev;
   ListNode<TKey>* next = node->m_next;
@@ -265,8 +280,8 @@ delink(ListNode<TKey>* node) {
   node->m_prev = ListNode<TKey>::OutOfListMarker;
 }
 
-template <class TKey, class TValue, class THashMap>
-inline void ThreadSafeLRUCache<TKey, TValue, THashMap>::
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
+inline void ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 pushFront(ListNode<TKey>* node) {
   ListNode<TKey>* oldRealHead = m_head.m_next;
   node->m_prev = &m_head;
@@ -275,14 +290,14 @@ pushFront(ListNode<TKey>* node) {
   m_head.m_next = node;
 }
 
-template <class TKey, class TValue, class THashMap>
-void ThreadSafeLRUCache<TKey, TValue, THashMap>::
+template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
+size_t ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 evict() {
   std::unique_lock<ListMutex> lock(m_listMutex);
   ListNode<TKey>* moribund = m_tail.m_prev;
   if (moribund == &m_head) {
     // List is empty, can't evict
-    return;
+    return 0;
   }
   delink(moribund);
   lock.unlock();
@@ -291,10 +306,15 @@ evict() {
   auto deleted_Res = res.eraseValue();
   if (deleted_Res == nullptr) {
     // Presumably unreachable
-    return;
+    return 0;
   }
-  Rai::Delete(deleted_Res);
+
+  size_t res_size = (*deleted_Res)->m_value->length();
+
+  junction::DefaultQSBR.enqueue(&ValueContainer::destroy, new ValueContainer(deleted_Res));
+
   Rai::Delete(moribund);
+  return res_size;
 }
 
 } // namespace tstarling
