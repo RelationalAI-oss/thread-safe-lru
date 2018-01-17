@@ -49,10 +49,6 @@ struct ListNode {
     }
 
     static ListNode<TKey>* const OutOfListMarker;
-
-    void destroy() {
-      Rai::Delete(this);
-    }
 };
 
 /**
@@ -227,28 +223,22 @@ insert(const TKey& key, const TValue& value, size_t value_size) {
   ListNode<TKey>* node = Rai::New<ListNode<TKey> >("new_Node", key);
   auto newValue = Rai::New<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
 
-  auto oldValue = m_map.exchange(key, newValue);
-  ListNode<TKey>* oldNode = nullptr;
-  if (oldValue) {
-    oldNode = oldValue->m_listNode;
-    m_size.fetch_sub(oldValue->m_value->length());
-    junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, oldValue);
+  if (!m_map.insert(key, newValue)) {
+    Rai::Delete(node);
+    Rai::Delete(newValue);
+    return false;
   }
+
+  // Note that we have to update the LRU list before we increment m_size, so
+  // that other threads don't attempt to evict list items before they even
+  // exist.
+  std::unique_lock<ListMutex> lock(m_listMutex);
+  pushFront(node);
+  lock.unlock();
 
   m_size.fetch_add(value_size);
 
-  std::unique_lock<ListMutex> lock(m_listMutex);
-  pushFront(node);
-  if(oldNode != nullptr) {
-    delink(oldNode);
-    lock.unlock();
-
-    junction::DefaultQSBR.enqueue(&ListNode<TKey>::destroy, oldNode);
-    return false;
-  } else {
-    lock.unlock();
-    return true;
-  }
+  return false;
 }
 
 template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
@@ -262,7 +252,7 @@ clear() {
     if(node_in_map) {
       junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, node_in_map);
     }
-    junction::DefaultQSBR.enqueue(&ListNode<TKey>::destroy, node);
+    Rai::Delete(node);
     node = next;
   }
   m_head.m_next = &m_tail;
@@ -312,7 +302,7 @@ evict() {
   m_size.fetch_sub(res_size);
 
   junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, deleted_Res);
-  junction::DefaultQSBR.enqueue(&ListNode<TKey>::destroy, moribund);
+  Rai::Delete(moribund);
   return res_size;
 }
 
