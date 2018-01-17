@@ -18,6 +18,8 @@
 #define incl_tstarling_SCALABLE_CACHE_H
 
 #include "thread-safe-lru/lru-cache.h"
+#include <rai/core.h>
+#include <rai/collections/thread_context.h>
 #include <thread>
 #include <chrono>
 #include <limits>
@@ -58,7 +60,7 @@ struct ThreadSafeScalableCache {
   ~ThreadSafeScalableCache() {
     m_isTerminated = true;
     m_gcThread.join();
-    DefaultQSBR.destroyContext(m_qsbrContext);
+    m_gcThreadContext.unregisterThread();
     clear();
   }
 
@@ -128,7 +130,7 @@ private:
 
   std::chrono::milliseconds m_gcIntervalMS;
 
-  junction::QSBR::Context m_qsbrContext;
+  Rai::Collections::ThreadContext m_gcThreadContext;
 };
 
 template <class TKey, class TValue, class THashMap>
@@ -159,7 +161,7 @@ gc() {
       }
     }
 
-    junction::DefaultQSBR.update(m_qsbrContext);
+    m_gcThreadContext.update();
     std::this_thread::sleep_for(m_gcIntervalMS);
   }
 };
@@ -176,7 +178,7 @@ ThreadSafeScalableCache(size_t maxSize, size_t gcIntervalMS, size_t numShards)
     m_shards.emplace_back(Rai::MakeShared<Shard>("new_Shard_in_ThreadSafeScalableCache"));
   }
 
-  m_qsbrContext = DefaultQSBR.createContext();
+  m_gcThreadContext.registerThread();
 
   m_gcThread = std::thread(&ThreadSafeScalableCache<TKey, TValue, THashMap>::gc, this);
 }
