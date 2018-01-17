@@ -309,6 +309,7 @@ evict() {
   }
 
   size_t res_size = deleted_Res->m_value->length();
+  m_size.fetch_sub(res_size);
 
   junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, deleted_Res);
   junction::DefaultQSBR.enqueue(&ListNode<TKey>::destroy, moribund);
