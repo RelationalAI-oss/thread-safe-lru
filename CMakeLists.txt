@@ -21,7 +21,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 file(GLOB LRUCache_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/thread-safe-lru/*.h")
-file(GLOB LRUCache_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+file(GLOB LRUCache_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
 file(GLOB LRUCache_SRC ${LRUCache_HEADERS} ${LRUCache_SOURCES})
 
 add_library(thread-safe-lru ${LRUCache_SRC})
