@@ -175,7 +175,7 @@ ThreadSafeScalableCache(size_t maxSize, size_t gcIntervalMS, size_t numShards)
     m_numShards = std::thread::hardware_concurrency() * 4;
   }
   for (size_t i = 0; i < m_numShards; i++) {
-    m_shards.emplace_back(Rai::MakeShared<Shard>("new_Shard_in_ThreadSafeScalableCache"));
+    m_shards.emplace_back(Rai::make_shared<Shard>("new_Shard_in_ThreadSafeScalableCache"));
   }
 
   m_gcThreadContext.registerThread();
