@@ -69,7 +69,7 @@ struct HashMapValue {
     ListNode<TKey>* m_listNode;
 
     void destroy() {
-      Rai::delete_object(this);
+      rai::delete_object(this);
     }
 };
 
@@ -220,12 +220,12 @@ template <class TKey, class TValue, class THashMap, int NUM_INSERT_MUTEX>
 bool ThreadSafeLRUCache<TKey, TValue, THashMap, NUM_INSERT_MUTEX>::
 insert(const TKey& key, const TValue& value, size_t value_size) {
   // Insert into the CHM
-  ListNode<TKey>* node = Rai::new_object<ListNode<TKey> >("new_Node", key);
-  auto newValue = Rai::new_object<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
+  ListNode<TKey>* node = rai::new_object<ListNode<TKey> >("new_Node", key);
+  auto newValue = rai::new_object<HashMapValue<TKey, TValue> >("shared_ptr_HashMapValue", value, node);
 
   if (!m_map.insert(key, newValue)) {
-    Rai::delete_object(node);
-    Rai::delete_object(newValue);
+    rai::delete_object(node);
+    rai::delete_object(newValue);
     return false;
   }
 
@@ -252,7 +252,7 @@ clear() {
     if(node_in_map) {
       junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, node_in_map);
     }
-    Rai::delete_object(node);
+    rai::delete_object(node);
     node = next;
   }
   m_head.m_next = &m_tail;
@@ -302,7 +302,7 @@ evict() {
   m_size.fetch_sub(res_size);
 
   junction::DefaultQSBR.enqueue(&HashMapValue<TKey, TValue>::destroy, deleted_Res);
-  Rai::delete_object(moribund);
+  rai::delete_object(moribund);
   return res_size;
 }
 
