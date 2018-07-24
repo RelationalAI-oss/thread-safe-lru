@@ -137,27 +137,31 @@ template <class TKey, class TValue, class THashMap>
 void ThreadSafeScalableCache<TKey, TValue, THashMap>::
 gc() {
   while(!m_isTerminated) {
-    size_t size = 0;
-    for (size_t i = 0; i < m_numShards; i++) {
-      size += m_shards[i]->size();
-    }
-
-    if(size >= m_maxSize) {
-      auto cmp = [](ShardPtr left, ShardPtr right) { return left->size() < right->size();};
-      std::priority_queue<ShardPtr, std::vector<ShardPtr>, decltype(cmp)> q(cmp);
+    if(m_maxSize > 0) { //no GC if there's no limit for the maximum size (i.e., m_maxSize = 0)
+      size_t size = 0;
       for (size_t i = 0; i < m_numShards; i++) {
-        q.push(m_shards[i]);
+        size += m_shards[i]->size();
       }
 
-      while(size >= m_maxSize && !q.empty()) {
-        auto shard = q.top();
-        q.pop();
-        size_t deleted_size = shard->evict();
-        if(deleted_size != 0) {
-          q.push(shard);
+      if (size >= m_maxSize) {
+        auto cmp = [](ShardPtr left, ShardPtr right) {
+          return left->size() < right->size();
+        };
+        std::priority_queue<ShardPtr, std::vector<ShardPtr>, decltype(cmp)> q(cmp);
+        for (size_t i = 0; i < m_numShards; i++) {
+          q.push(m_shards[i]);
         }
 
-        size -= deleted_size;
+        while (size >= m_maxSize && !q.empty()) {
+          auto shard = q.top();
+          q.pop();
+          size_t deleted_size = shard->evict();
+          if (deleted_size != 0) {
+            q.push(shard);
+          }
+
+          size -= deleted_size;
+        }
       }
     }
 
